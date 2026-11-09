@@ -143,15 +143,32 @@ Defenders should be aware that behavioral detection coverage varies by process. 
 
 The injector had empty FileVersion, Description, Product, Company, and OriginalFileName fields — the same red flag as Early Bird. This is still detectable, though it only reveals the injector ran, not what it targeted.
 
+## Bonus: process hollowing failed — and that's a finding
+
+I also attempted classic process hollowing (T1055.012) against the same target, three ways:
+
+1. **Raw shellcode + suspended process** — Unmapped RuntimeBroker's image, wrote shellcode at image base, resumed. Crash. The Windows loader fires kernel-mode APCs that need a valid PE for import resolution and TLS setup. Raw shellcode has no PE structure.
+
+2. **Raw shellcode + running process** — Found a running RuntimeBroker, suspended it, unmapped its image, wrote shellcode. Silent crash. Other threads in the live process reference the original image — unmapping it destroys their exception handlers and function pointers.
+
+3. **PE replacement + suspended process** — Built a proper PE mapper (parse headers, map 8 sections, apply relocations, update PEB ImageBaseAddress). Sliver PE allocated at its preferred base, PEB updated. Still crashed: access violation at an offset in the **original** image base range, not the new one. Modern Windows 10+ loader references the original base from kernel-mode structures that survive PEB modification.
+
+**Detection lesson:** Simple PEB-based process hollowing that worked on Windows 7/8 no longer works reliably against modern Windows. The OS loader has structural defenses. Production tools (Cobalt Strike, Donut) use advanced techniques like transacted or phantom hollowing. For defenders: `NtUnmapViewOfSection` on a process's own image section is highly abnormal and worth alerting on.
+
 ## Key takeaway
 
 Thread hijacking into RuntimeBroker.exe eliminated the **only** detection signal that Early Bird left behind (the parent-child mismatch), achieving zero actionable Sysmon events and zero Defender detections. But the same technique against svchost.exe was caught by Defender's behavioral engine — proving that target process selection is a detection variable, not just an operational preference.
+
+Process hollowing failed against modern Windows — the OS's own loader hardening is a defense layer that simple tooling can't bypass.
 
 For defenders: if your detection strategy relies on parent-child process relationships, thread hijacking bypasses it entirely. Layer your detections across ProcessAccess (ID 10), memory allocation patterns, and kernel-level thread context monitoring.
 
 ## Files
 
-- [`src/threadhijack.c`](src/threadhijack.c) — The injector source
+- [`src/threadhijack.c`](src/threadhijack.c) — Thread execution hijacking injector (T1055.003)
+- [`src/hollow.c`](src/hollow.c) — Process hollowing, suspended process + raw shellcode (crashed)
+- [`src/hollow2.c`](src/hollow2.c) — Process hollowing, running process + raw shellcode (crashed)
+- [`src/pehollow.c`](src/pehollow.c) — PE hollowing with section mapping and relocations (crashed on Win10+)
 
 ## Related
 
