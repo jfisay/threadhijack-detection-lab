@@ -155,17 +155,52 @@ I also attempted classic process hollowing (T1055.012) against the same target, 
 
 **Detection lesson:** Simple PEB-based process hollowing that worked on Windows 7/8 no longer works reliably against modern Windows. The OS loader has structural defenses. Production tools (Cobalt Strike, Donut) use advanced techniques like transacted or phantom hollowing. For defenders: `NtUnmapViewOfSection` on a process's own image section is highly abnormal and worth alerting on.
 
+## SYSTEM escalation: service-based injection bypasses Defender entirely
+
+After discovering that svchost injection was caught, I explored whether SYSTEM execution could be achieved without touching svchost's memory. The answer: **yes**.
+
+**Technique chain:**
+1. `sc.exe create` — create a Windows service (legitimate admin API)
+2. Service runs `suspended-ctx.exe` as NT AUTHORITY\SYSTEM
+3. `suspended-ctx.exe` creates RuntimeBroker.exe suspended — inheriting the SYSTEM token
+4. Shellcode injected into suspended RuntimeBroker via SetThreadContext
+5. Beacon checks in as **NT AUTHORITY\SYSTEM** with full privileges
+
+**Result:** Full SYSTEM shell inside RuntimeBroker.exe — SeDebugPrivilege, SeImpersonatePrivilege, SeTcbPrivilege, the complete set — and **zero Defender detections**.
+
+### Comparison: three paths to SYSTEM
+
+| Approach | Target process | SYSTEM? | Defender |
+|----------|---------------|---------|----------|
+| Thread hijack → svchost.exe | svchost (direct) | Yes | **CAUGHT** |
+| Thread hijack → spoolsv/SearchIndexer | SYSTEM services | Injection OK, no beacon | Not detected |
+| Service → suspended RuntimeBroker | RuntimeBroker (new) | Yes | **NOT DETECTED** |
+
+### Why SYSTEM services didn't beacon
+
+Thread hijacking into spoolsv.exe, SearchIndexer.exe, and qemu-ga.exe succeeded (all three processes survived), but no beacons checked in. These SYSTEM service threads are deep in kernel I/O wait states — the redirected RIP can't cleanly take over. RuntimeBroker's idle message-pump threads handle hijacking cleanly; active service threads don't.
+
+### Token theft is hardened
+
+Attempted `OpenProcessToken` on SYSTEM processes (svchost, spoolsv) with SeDebugPrivilege enabled — all returned Access Denied (error 5). Modern Windows 10+ hardens token DACLs even against admin. Service creation achieves SYSTEM through a different, auditable path.
+
+### Detection lesson
+
+Defender's behavioral engine is **process-name-specific, not privilege-level-specific**. A RuntimeBroker.exe running as NT AUTHORITY\SYSTEM is inherently anomalous (it normally runs as the logged-in user at Medium integrity), but Defender doesn't flag it. Defenders should monitor: service creation events (Security 4697, Sysmon 12/13) for unusual binpaths, and process tokens that don't match the expected integrity level for that process name.
+
 ## Key takeaway
 
-Thread hijacking into RuntimeBroker.exe eliminated the **only** detection signal that Early Bird left behind (the parent-child mismatch), achieving zero actionable Sysmon events and zero Defender detections. But the same technique against svchost.exe was caught by Defender's behavioral engine — proving that target process selection is a detection variable, not just an operational preference.
+Thread hijacking into RuntimeBroker.exe eliminated the **only** detection signal that Early Bird left behind (the parent-child mismatch), achieving zero actionable Sysmon events and zero Defender detections. Combining this with service-based SYSTEM escalation produces a full NT AUTHORITY\SYSTEM shell with zero detections — same result as svchost injection, which Defender caught immediately.
 
-Process hollowing failed against modern Windows — the OS's own loader hardening is a defense layer that simple tooling can't bypass.
+**Defender's behavioral monitoring is process-name-specific.** svchost.exe gets heavy scrutiny; RuntimeBroker.exe does not, even at SYSTEM integrity. For attackers, this means target process selection determines detection outcome. For defenders, it means behavioral rules must cover all process contexts, not just known high-value targets.
 
-For defenders: if your detection strategy relies on parent-child process relationships, thread hijacking bypasses it entirely. Layer your detections across ProcessAccess (ID 10), memory allocation patterns, and kernel-level thread context monitoring.
+For defenders: if your detection strategy relies on parent-child process relationships, thread hijacking bypasses it entirely. Layer your detections across ProcessAccess (ID 10), memory allocation patterns, kernel-level thread context monitoring, and anomalous token/integrity combinations per process.
 
 ## Files
 
 - [`src/threadhijack.c`](src/threadhijack.c) — Thread execution hijacking injector (T1055.003)
+- [`src/suspended-ctx.c`](src/suspended-ctx.c) — Suspended process + SetThreadContext injection
+- [`src/tokensteal.c`](src/tokensteal.c) — Token theft tool (blocked by Win10+ token hardening)
 - [`src/hollow.c`](src/hollow.c) — Process hollowing, suspended process + raw shellcode (crashed)
 - [`src/hollow2.c`](src/hollow2.c) — Process hollowing, running process + raw shellcode (crashed)
 - [`src/pehollow.c`](src/pehollow.c) — PE hollowing with section mapping and relocations (crashed on Win10+)
